@@ -26,6 +26,8 @@ export interface ConduitConfig {
   wallet?: import('../adapters/types.js').WalletAdapter;
   /** Custom signer plugin (KMS/HSM). Takes precedence over keypair when set. */
   signer?: Signer;
+  /** Signing behaviour for wallet adapters and custom signers (e.g. `signatureTimeoutMs`). */
+  signerOptions?: import('../signer.js').SignerOptions;
   /** Override default Soroban RPC URL */
   rpcUrl?: string;
   /** Override deployed DripFactory contract ID */
@@ -56,6 +58,25 @@ export interface ConduitConfig {
    * retrying. Default 30_000 (30 seconds).
    */
   negativeCacheTtlMs?: number;
+  /**
+   * How long a `GovernorModule.getConfig()` read is reused, in milliseconds.
+   * Protocol parameters only change when a governance proposal passes, so a
+   * short window removes the need to re-simulate on every poll. Default
+   * 30_000 (30 seconds, ~6 ledgers). Set `0` to disable the cache and
+   * re-simulate on every call.
+   */
+  governorConfigCacheTtlMs?: number;
+  /**
+   * Custom `fetch` used for Soroban RPC requests and for the fee estimator's
+   * Horizon `/fee_stats` call — for edge runtimes (Cloudflare Workers),
+   * proxies/custom HTTP agents, request-tracing headers, or timeouts that the
+   * global `fetch` does not provide.
+   *
+   * RPC routing is registered per `rpcUrl` and is process-wide, so two
+   * clients sharing an `rpcUrl` share the most recently supplied function.
+   * Indexer (GraphQL) traffic is configured separately on `GraphQLIndexer`.
+   */
+  customFetch?: typeof fetch;
 }
 
 export interface StreamInfo {
@@ -92,6 +113,12 @@ export interface CreateStreamParams {
   durationSeconds?: number;
   /** Unix timestamp; defaults to current ledger time */
   startTime?: number;
+  /** Optional stop/end time (Unix timestamp) */
+  stopTime?: number;
+  /** Optional stop/end time alias (Unix timestamp) */
+  endTime?: number;
+  /** Optional sender address */
+  sender?: string;
   /** Whether the sender can claw back unstreamed tokens */
   clawbackEnabled?: boolean;
   /** Override rate in stroops/s (mutually exclusive with durationSeconds) */
@@ -100,6 +127,12 @@ export interface CreateStreamParams {
 
 /** Configuration for a single stream in a batch creation. */
 export type StreamConfig = CreateStreamParams;
+
+export interface ValidationResult {
+  isValid: boolean;
+  errors: string[];
+  error?: string;
+}
 
 export interface CreateStreamResult {
   streamId:      bigint;
@@ -136,6 +169,13 @@ export interface GetStreamInfosOptions {
   maxConcurrency?: number;
 }
 
+export interface BatchGetStreamsOptions extends GetStreamInfosOptions {
+  /** Number of stream IDs read per chunk. Defaults to 20. */
+  chunkSize?: number;
+  /** Pause in milliseconds between chunks, to stay under RPC rate limits. Defaults to 0. */
+  chunkDelayMs?: number;
+}
+
 export interface GetStreamInfosFailure {
   id:    bigint;
   error: string;
@@ -153,6 +193,9 @@ export interface GovernorConfig {
   maxDurationSeconds:  number;
   maxRatePerSecond:    bigint;
   factoryAddress?:     string;
+  votingDelay?:        number;
+  votingPeriod?:       number;
+  proposalThreshold?:  bigint;
 }
 
 // ── Events ──────────────────────────────────────────────────────────────────
@@ -161,8 +204,30 @@ export interface WithdrawEvent  { amount: bigint; recipient: string; totalWithdr
 export interface CancelEvent    { refundAmount: bigint; withdrawnSoFar: bigint; sender: string; sequence?: bigint; }
 export interface PauseEvent     { pausedAt: number; withdrawable: bigint; sender: string; sequence?: bigint; }
 export interface ResumeEvent    { resumedAt: number; sender: string; sequence?: bigint; }
-export interface TopUpEvent     { amount: bigint; newBalance: bigint; sender: string; sequence?: bigint; }
-export interface ClawbackEvent  { amount: bigint; sender: string; sequence?: bigint; }
+/** Published when the sender tops up a stream (`topped_up` topic). */
+export interface StreamTopUpEvent {
+  /** Amount added to the stream's deposit. */
+  amount: bigint;
+  /** Stream balance after the top-up. */
+  newBalance: bigint;
+  /** The address that funded the top-up (topics[1] actor). */
+  sender: string;
+  sequence?: bigint;
+}
+
+/** Published when the sender claws back unstreamed funds (`clawback` topic). */
+export interface StreamClawbackedEvent {
+  /** Amount clawed back to the sender. */
+  amount: bigint;
+  /** The address that initiated the clawback (topics[1] actor). */
+  sender: string;
+  sequence?: bigint;
+}
+
+/** @deprecated Use {@link StreamTopUpEvent}. */
+export type TopUpEvent = StreamTopUpEvent;
+/** @deprecated Use {@link StreamClawbackedEvent}. */
+export type ClawbackEvent = StreamClawbackedEvent;
 
 /** Published once when the factory deploys a new DripStream (`created` topic). */
 export interface CreatedEvent {
@@ -224,13 +289,31 @@ export interface EventGap {
   actual: bigint;
 }
 
+/** Maps each handler-facing event name to its decoded payload type. */
+export interface EventPayloadMap {
+  withdraw:          WithdrawEvent;
+  cancel:            CancelEvent;
+  pause:             PauseEvent;
+  resume:            ResumeEvent;
+  topUp:             StreamTopUpEvent;
+  clawback:          StreamClawbackedEvent;
+  created:           CreatedEvent;
+  forceCancel:       ForceCancelEvent;
+  recipientTransfer: RecipientTransferEvent;
+  operatorSet:       OperatorSetEvent;
+  operatorRevoke:    OperatorRevokedEvent;
+}
+
+/** Union of every decoded stream event payload. */
+export type StreamEventPayload = EventPayloadMap[keyof EventPayloadMap];
+
 export interface StreamEventHandlers {
   onWithdraw?: (e: WithdrawEvent)  => void;
   onCancel?:   (e: CancelEvent)    => void;
   onPause?:    (e: PauseEvent)     => void;
   onResume?:   (e: ResumeEvent)    => void;
-  onTopUp?:    (e: TopUpEvent)     => void;
-  onClawback?: (e: ClawbackEvent)  => void;
+  onTopUp?:    (e: StreamTopUpEvent) => void;
+  onClawback?: (e: StreamClawbackedEvent) => void;
   /** Called when the factory deploys a new stream. Optional — most subscribers attach after a stream already exists. */
   onCreated?:            (e: CreatedEvent)             => void;
   /** Called when the recipient force-cancels a paused stream. */
@@ -251,6 +334,11 @@ export interface StreamEventHandlers {
   onGap?:      (gap: EventGap)     => void;
   /** Polling interval in ms; default 5000 */
   pollInterval?: number;
+  /**
+   * Number of recent event IDs remembered to drop duplicates delivered by
+   * overlapping `getEvents` ledger ranges. Default 1000; `0` disables.
+   */
+  dedupWindowSize?: number;
   /**
    * Upper bound (ms) for the exponential backoff delay applied between
    * retries after consecutive polling failures. Default 60000.
@@ -279,6 +367,15 @@ export interface BatchWithdrawItem {
 export interface BatchWithdrawResult {
   streamId: bigint;
   success: boolean;
+  txHash?: string;
+  error?: string;
+}
+
+export interface BatchCreateStreamResult {
+  index: number;
+  success: boolean;
+  streamId?: bigint;
+  streamAddress?: string;
   txHash?: string;
   error?: string;
 }

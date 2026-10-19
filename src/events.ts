@@ -13,6 +13,8 @@ import type {
   CancelEvent,
   PauseEvent,
   ResumeEvent,
+  StreamTopUpEvent,
+  StreamClawbackedEvent,
   TopUpEvent,
   ClawbackEvent,
   CreatedEvent,
@@ -94,6 +96,27 @@ function addressField(val: xdr.ScVal | undefined): string {
   }
 }
 
+// ── Deduplication ─────────────────────────────────────────────────────────────
+
+/** Bounded insertion-ordered set of recently seen event IDs (oldest evicted first). */
+class RecentIdWindow {
+  private readonly ids = new Set<string>();
+  constructor(private readonly size: number) {}
+
+  /** Returns `true` if `id` was already seen; otherwise records it and returns `false`. */
+  seen(id: string | undefined): boolean {
+    if (this.size <= 0 || !id) return false;
+    if (this.ids.has(id)) return true;
+    this.ids.add(id);
+    if (this.ids.size > this.size) {
+      this.ids.delete(this.ids.values().next().value as string);
+    }
+    return false;
+  }
+}
+
+const DEFAULT_DEDUP_WINDOW = 1000;
+
 // ── Subscription ──────────────────────────────────────────────────────────────
 
 /**
@@ -126,6 +149,7 @@ export function subscribeToStream(
   // Guard against recursive gap detection while a replay is in flight.
   let   isReplaying = false;
   let   lastSequence: bigint | undefined;
+  const recentIds              = new RecentIdWindow(handlers.dedupWindowSize ?? DEFAULT_DEDUP_WINDOW);
 
   /**
    * Backfill events whose sequence falls inside a detected gap.
@@ -154,6 +178,7 @@ export function subscribeToStream(
         .sort((a, b) => (a.seq < b.seq ? -1 : a.seq > b.seq ? 1 : 0));
 
       for (const item of missed) {
+        if (recentIds.seen(item.event.id)) continue;
         dispatchIsolated(item.event, handlers);
       }
     } catch (err) {
@@ -193,6 +218,7 @@ export function subscribeToStream(
 
       if (response.events.length > 0) {
         for (const event of response.events) {
+          if (recentIds.seen(event.id)) continue;
           const sequence = dispatchIsolated(event, handlers);
           if (sequence !== undefined) {
             if (lastSequence !== undefined && sequence !== lastSequence + 1n) {
@@ -276,6 +302,45 @@ export function subscribeToStream(
       // the entire closure graph, which may never happen if any external
       // reference to the Subscription object is kept.
       handlers = {};
+    },
+  };
+}
+
+/**
+ * Subscribe to on-chain events for multiple DripStream contracts at once.
+ *
+ * A convenience that fans out to one `subscribeToStream` call per address
+ * internally and returns a single `Subscription` whose `unsubscribe()`
+ * tears all of them down together (#797). Without this, a UI showing a
+ * portfolio of streams (5, 20, 50 of them) has to call `subscribeToStream`
+ * once per stream and separately track and tear down that many independent
+ * `Subscription` objects itself.
+ *
+ * All addresses share the same `handlers` and each keeps its own polling
+ * interval, cursor, and backoff state — this does not merge the underlying
+ * polling into a single request. Event payloads (`WithdrawEvent`,
+ * `CancelEvent`, etc.) don't carry the originating stream's address, so a
+ * shared handler firing across several addresses can't by itself tell
+ * which stream an event came from; subscribe per-group with distinct
+ * handlers if you need to attribute events to a specific stream.
+ *
+ * @param rpcUrl    Soroban RPC endpoint
+ * @param addresses DripStream contract addresses (C…) to subscribe to
+ * @param handlers  Event handler callbacks, shared across all addresses
+ * @returns         `{ unsubscribe }` — stops polling for every address
+ */
+export function subscribeToStreams(
+  rpcUrl:    string,
+  addresses: string[],
+  handlers:  StreamEventHandlers,
+): Subscription {
+  const subscriptions = addresses.map((address) => subscribeToStream(rpcUrl, address, handlers));
+
+  return {
+    unsubscribe: () => {
+      for (const sub of subscriptions) {
+        sub.unsubscribe();
+      }
     },
   };
 }
@@ -388,7 +453,7 @@ export function dispatchEvent(
       if (!handlers.onTopUp) break;
       // data: (amount: i128, new_balance: i128)
       const fields = tupleFields(event.value);
-      const data: TopUpEvent = {
+      const data: StreamTopUpEvent = {
         sender:     actor,
         amount:     i128Field(fields, 0),
         newBalance: i128Field(fields, 1),
@@ -401,7 +466,7 @@ export function dispatchEvent(
     case TOPIC.CLAWBACK: {
       if (!handlers.onClawback) break;
       // data: amount: i128 (bare scalar, not a tuple)
-      const data: ClawbackEvent = {
+      const data: StreamClawbackedEvent = {
         sender: actor,
         amount: scValToI128(event.value),
         ...seq,
@@ -481,4 +546,115 @@ export function dispatchEvent(
   }
 
   return sequence;
+}
+
+// ── History (paginated, one-shot) ────────────────────────────────────────────
+
+/** Soroban RPC retains roughly seven days of events at ~5s per ledger. */
+export const DEFAULT_HISTORY_LOOKBACK_LEDGERS = 120_000;
+export const DEFAULT_HISTORY_PAGE_SIZE = 50;
+export const MAX_HISTORY_PAGE_SIZE = 200;
+
+interface StreamHistoryBase {
+  /** Soroban event id, unique per event. */
+  id:        string;
+  ledger:    number;
+  /** ISO-8601 ledger close time. */
+  timestamp: string;
+  txHash:    string;
+}
+
+/** One decoded stream event, discriminated by `kind`. */
+export type StreamHistoryEntry = StreamHistoryBase & (
+  | { kind: 'created';  event: CreatedEvent }
+  | { kind: 'withdraw'; event: WithdrawEvent }
+  | { kind: 'top_up';   event: TopUpEvent }
+  | { kind: 'pause';    event: PauseEvent }
+  | { kind: 'resume';   event: ResumeEvent }
+  | { kind: 'cancel';   event: CancelEvent }
+  | { kind: 'clawback'; event: ClawbackEvent }
+);
+
+export interface StreamHistoryPage {
+  /** Entries in ledger order, oldest first. */
+  entries:    StreamHistoryEntry[];
+  /** Pass as `cursor` to fetch the next page; `undefined` when exhausted. */
+  nextCursor: string | undefined;
+}
+
+export interface StreamHistoryOptions {
+  /** Cursor from a previous page's `nextCursor`. Omit for the first page. */
+  cursor?:      string;
+  /** Events per page, 1–{@link MAX_HISTORY_PAGE_SIZE}. Default {@link DEFAULT_HISTORY_PAGE_SIZE}. */
+  limit?:       number;
+  /**
+   * Ledger to start from on the first page (ignored when `cursor` is set).
+   * Defaults to {@link DEFAULT_HISTORY_LOOKBACK_LEDGERS} before the latest
+   * ledger. Soroban RPC only serves events inside its retention window; use
+   * the indexer for older history.
+   */
+  startLedger?: number;
+}
+
+/**
+ * Fetch one page of a stream contract's event history.
+ *
+ * Unlike {@link subscribeToStream} this is a single request, suited to
+ * "load more" / infinite-scroll UIs: feed `nextCursor` back as `cursor`.
+ */
+export async function getStreamHistory(
+  rpcUrl:        string,
+  streamAddress: string,
+  options:       StreamHistoryOptions = {},
+): Promise<StreamHistoryPage> {
+  const limit = options.limit ?? DEFAULT_HISTORY_PAGE_SIZE;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_HISTORY_PAGE_SIZE) {
+    throw new Error(`limit must be an integer between 1 and ${MAX_HISTORY_PAGE_SIZE}`);
+  }
+
+  const server = createRpcServer(rpcUrl);
+  let request: SorobanRpc.Server.GetEventsRequest;
+  const filters = [{ type: 'contract' as const, contractIds: [streamAddress] }];
+  if (options.cursor) {
+    request = { cursor: options.cursor, filters, limit };
+  } else {
+    let startLedger = options.startLedger;
+    if (startLedger === undefined) {
+      const latest = await server.getLatestLedger();
+      startLedger = Math.max(1, latest.sequence - DEFAULT_HISTORY_LOOKBACK_LEDGERS);
+    }
+    request = { startLedger, filters, limit };
+  }
+
+  const response = await server.getEvents(request);
+  const entries: StreamHistoryEntry[] = [];
+
+  for (const raw of response.events) {
+    let entry: StreamHistoryEntry | undefined;
+    const base: StreamHistoryBase = {
+      id: raw.id, ledger: raw.ledger, timestamp: raw.ledgerClosedAt, txHash: raw.txHash,
+    };
+    try {
+      dispatchEvent(raw, {
+        onCreated:  (event) => { entry = { ...base, kind: 'created', event }; },
+        onWithdraw: (event) => { entry = { ...base, kind: 'withdraw', event }; },
+        onTopUp:    (event) => { entry = { ...base, kind: 'top_up', event }; },
+        onPause:    (event) => { entry = { ...base, kind: 'pause', event }; },
+        onResume:   (event) => { entry = { ...base, kind: 'resume', event }; },
+        onCancel:   (event) => { entry = { ...base, kind: 'cancel', event }; },
+        onClawback: (event) => { entry = { ...base, kind: 'clawback', event }; },
+      });
+    } catch (err) {
+      // One undecodable event must not hide the rest of the page.
+      console.warn('[conduit-sdk] skipping undecodable history event:', err);
+    }
+    if (entry) entries.push(entry);
+  }
+
+  // A full page means there may be more. The cursor is a response field the
+  // SDK's types omit; fall back to the last event's paging token.
+  const last = response.events[response.events.length - 1];
+  const cursor = (response as { cursor?: string }).cursor ?? last?.pagingToken;
+  const nextCursor = response.events.length >= limit ? cursor : undefined;
+  return { entries, nextCursor };
 }

@@ -16,6 +16,13 @@ export interface RelayerState {
 
 export type RelayerStateTransition = 'connecting' | 'connected' | 'disconnected' | 'reconnecting' | 'destroyed';
 
+/** A message queued while the WebSocket is offline, with metadata for TTL checks (#858). */
+export interface QueuedMessage {
+  message: WebSocketMessage;
+  /** Unix milliseconds when the message was enqueued. */
+  enqueuedAt: number;
+}
+
 export interface WebSocketRelayerOptions {
   maxPendingMessages?: number;
   maxReconnectAttempts?: number;
@@ -24,6 +31,11 @@ export interface WebSocketRelayerOptions {
   onStateChange?: StateChangeHandler;
   heartbeatIntervalMs?: number;
   heartbeatTimeoutMs?: number;
+  /**
+   * Maximum milliseconds a message may sit in the offline buffer before it is
+   * silently dropped on the next flush. `0` (default) disables TTL expiry.
+   */
+  offlineBufferTtlMs?: number;
 }
 
 export class WebSocketRelayer {
@@ -41,8 +53,9 @@ export class WebSocketRelayer {
   private maxReconnectAttempts: number;
   private reconnectDelayMs: number;
   private maxReconnectDelayMs: number;
-  private pendingMessages: WebSocketMessage[] = [];
+  private offlineQueue: QueuedMessage[] = [];
   private maxPendingMessages: number;
+  private offlineBufferTtlMs: number;
   private stateTransition: RelayerStateTransition = 'disconnected';
   private heartbeatIntervalMs: number;
   private heartbeatTimeoutMs: number;
@@ -56,6 +69,7 @@ export class WebSocketRelayer {
     this.reconnectDelayMs = options?.reconnectDelayMs ?? 1000;
     this.maxReconnectDelayMs = options?.maxReconnectDelayMs ?? 30_000;
     this.maxPendingMessages = options?.maxPendingMessages ?? 1000;
+    this.offlineBufferTtlMs = options?.offlineBufferTtlMs ?? 0;
     this.heartbeatIntervalMs = options?.heartbeatIntervalMs ?? 30_000;
     this.heartbeatTimeoutMs = options?.heartbeatTimeoutMs ?? 5_000;
     if (options?.onStateChange) {
@@ -73,7 +87,7 @@ export class WebSocketRelayer {
         this.reconnectAttempts > 0 &&
         (!this.ws || this.ws.readyState !== 1),
       destroyed: this.isDestroyed,
-      pendingCount: this.pendingMessages.length,
+      pendingCount: this.offlineQueue.length,
     };
   }
 
@@ -196,6 +210,11 @@ export class WebSocketRelayer {
         };
 
         ws.onmessage = (event: MessageEvent) => {
+          // Any inbound frame proves the link is alive, not just a pong.
+          if (this.awaitingPong) {
+            this.awaitingPong = false;
+            this.clearHeartbeatTimeout();
+          }
           this.handleMessageSafe(event.data);
         };
 
@@ -272,6 +291,7 @@ export class WebSocketRelayer {
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    if (!(this.heartbeatIntervalMs > 0)) return;
     this.heartbeatInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === 1 && !this.awaitingPong) {
         try {
@@ -279,7 +299,7 @@ export class WebSocketRelayer {
           this.awaitingPong = true;
           this.heartbeatTimeout = setTimeout(() => {
             if (this.awaitingPong && this.ws) {
-              this.ws.close();
+              this.handleHeartbeatTimeout();
             }
           }, this.heartbeatTimeoutMs);
         } catch {
@@ -287,6 +307,35 @@ export class WebSocketRelayer {
         }
       }
     }, this.heartbeatIntervalMs);
+  }
+
+  /**
+   * No pong arrived in time: the connection is half-open (NAT timeout, device
+   * sleep). `close()` on such a socket may never fire `onclose`, so detach the
+   * dead socket and drive the reconnect ourselves instead of waiting on it.
+   */
+  private handleHeartbeatTimeout(): void {
+    const dead = this.ws;
+    this.stopHeartbeat();
+    this.ws = null;
+    if (dead) {
+      dead.onopen = null;
+      dead.onmessage = null;
+      dead.onclose = null;
+      dead.onerror = null;
+      try {
+        dead.close();
+      } catch {
+        // Socket already closed/closing; nothing to clean up.
+      }
+    }
+    if (this.isDestroyed) return;
+    if (this.reconnectEnabled && this.shouldAttemptReconnect()) {
+      void this.attemptReconnect();
+    } else {
+      if (this.isPermanentlyDown()) this.reconnectExhausted = true;
+      this.emitStateChange('disconnected');
+    }
   }
 
   private stopHeartbeat(): void {
@@ -316,11 +365,20 @@ export class WebSocketRelayer {
   }
 
   private flushPendingMessages(): void {
-    const pending = this.pendingMessages;
-    this.pendingMessages = [];
-    for (const msg of pending) {
-      this.send(msg).catch(() => {});
+    const now = Date.now();
+    const pending = this.offlineQueue;
+    this.offlineQueue = [];
+    for (const queued of pending) {
+      if (this.offlineBufferTtlMs > 0 && now - queued.enqueuedAt > this.offlineBufferTtlMs) {
+        continue;
+      }
+      this.send(queued.message).catch(() => {});
     }
+  }
+
+  /** Returns a snapshot of the offline queue contents (for inspection/debugging). */
+  public getOfflineQueue(): QueuedMessage[] {
+    return this.offlineQueue.slice();
   }
 
   /**
@@ -412,15 +470,15 @@ export class WebSocketRelayer {
   }
 
   /**
-   * Push onto the bounded pending queue, dropping the oldest message once
+   * Push onto the bounded offline queue, dropping the oldest entry once
    * `maxPendingMessages` is reached (see #491) — `send()` must route through
-   * this rather than pushing to `pendingMessages` directly.
+   * this rather than pushing to `offlineQueue` directly.
    */
   private _queueMessage(message: WebSocketMessage): void {
-    if (this.pendingMessages.length >= this.maxPendingMessages) {
-      this.pendingMessages.shift();
+    if (this.offlineQueue.length >= this.maxPendingMessages) {
+      this.offlineQueue.shift();
     }
-    this.pendingMessages.push(message);
+    this.offlineQueue.push({ message, enqueuedAt: Date.now() });
   }
 
   async send(message: WebSocketMessage): Promise<void> {
@@ -483,7 +541,7 @@ export class WebSocketRelayer {
     this.reconnectEnabled = false;
     this.reconnectExhausted = true;
     this.connectPromise = null;
-    this.pendingMessages = [];
+    this.offlineQueue = [];
     this.reconnectAttempts = this.maxReconnectAttempts;
     this.stopHeartbeat();
 
