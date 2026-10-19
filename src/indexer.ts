@@ -1,4 +1,4 @@
-import { ConduitError, UNKNOWN_CONTRACT_ERROR_CODE } from './errors.js';
+import { ConduitError, IndexerMaxPagesExceededError, UNKNOWN_CONTRACT_ERROR_CODE } from './errors.js';
 import { IndexerTimeoutError, OperationAbortedError } from './errors.js';
 import { bigintSafeStringify } from './utils.js';
 
@@ -29,6 +29,18 @@ export interface GraphQLQueryOptions {
    * query, e.g. for one-off queries the server has never seen.
    */
   persist?: boolean;
+}
+
+export interface IndexerQueryMetric {
+  queryName: string;
+  durationMs: number;
+  success: boolean;
+  error?: Error;
+}
+
+export interface IndexerConfig {
+  endpoint: string;
+  onQueryMetric?: (metric: IndexerQueryMetric) => void;
 }
 
 export interface GraphQLSubscriptionOptions {
@@ -77,8 +89,38 @@ interface GraphQLServerMessage {
  * `dashboard/transaction-history.ts` and `examples/dashboard/.../apollo-client.ts`).
  */
 export const DEFAULT_INDEXER_TIMEOUT_MS = 15_000;
-/** Maximum number of pages fetched by {@link GraphQLIndexer.fetchAll}. */
+
+/**
+ * The default upper bound on the number of pages {@link GraphQLIndexer.fetchAll}
+ * will request before throwing an {@link IndexerMaxPagesExceededError}.
+ * Override per-call via `fetchAllOptions.maxPages`.
+ */
 export const DEFAULT_INDEXER_MAX_PAGES = 1_000;
+
+/**
+ * Options accepted by {@link GraphQLIndexer.fetchAll} (typed variant).
+ */
+export interface FetchAllOptions<TPage> {
+  /**
+   * The initial GraphQL query options (same shape as {@link GraphQLQueryOptions}).
+   * `variables` will be merged with `{ cursor }` on every subsequent page.
+   */
+  query: string;
+  variables?: Record<string, unknown>;
+  headers?: Record<string, string>;
+  /**
+   * Called after each page is fetched. Return the cursor string to use for
+   * the next page, or `null` / `undefined` when there are no more pages.
+   */
+  getNextCursor: (page: TPage) => string | null | undefined;
+  /**
+   * Maximum number of pages to fetch before throwing
+   * {@link IndexerMaxPagesExceededError}. Defaults to
+   * {@link DEFAULT_INDEXER_MAX_PAGES} (1 000).
+   */
+  maxPages?: number;
+}
+
 /**
  * Computes the SHA-256 hex digest of `input` using the Web Crypto API,
  * falling back to Node's `crypto` module when `crypto.subtle` is not
@@ -108,6 +150,43 @@ function isPersistedQueryNotFound(body: unknown): boolean {
       typeof error === 'object' &&
       ((error as { message?: string }).message ?? '').includes('PERSISTED_QUERY_NOT_FOUND'),
   );
+}
+
+/** Relay-style page metadata decoded from a GraphQL `pageInfo` object. */
+export interface IndexerPageInfo {
+  hasNextPage: boolean;
+  hasPreviousPage: boolean;
+  startCursor: string | null;
+  endCursor: string | null;
+}
+
+/** A single cursor-paginated page of results. */
+export interface IndexerPage<T> {
+  items: T[];
+  pageInfo: IndexerPageInfo;
+}
+
+/** Options for {@link GraphQLIndexer.fetchStreamsBySender}. */
+export interface FetchStreamsBySenderOptions
+  extends Omit<GraphQLQueryOptions, 'query' | 'variables'> {
+  /** Page size when paging forward (with or without `afterCursor`). */
+  first?: number;
+  /** Page size when paging backward with `beforeCursor`. */
+  last?: number;
+  /** Return items after this cursor (a previous page's `pageInfo.endCursor`). */
+  afterCursor?: string;
+  /** Return items before this cursor (a previous page's `pageInfo.startCursor`). */
+  beforeCursor?: string;
+}
+
+function decodePageInfo(raw: unknown): IndexerPageInfo {
+  const info = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  return {
+    hasNextPage: info.hasNextPage === true,
+    hasPreviousPage: info.hasPreviousPage === true,
+    startCursor: typeof info.startCursor === 'string' ? info.startCursor : null,
+    endCursor: typeof info.endCursor === 'string' ? info.endCursor : null,
+  };
 }
 
 interface PaginatedCollection {
@@ -141,15 +220,18 @@ function findPaginatedCollection(value: unknown): PaginatedCollection | undefine
 
 export class GraphQLIndexer {
   private endpoint: string;
+  private readonly onQueryMetric: ((metric: IndexerQueryMetric) => void) | undefined;
   private activeSubscriptions: Set<IndexerSubscription> = new Set();
   private isDestroyed = false;
   private subCounter = 0;
 
-  constructor(endpoint: string) {
+  constructor(endpointOrConfig: string | IndexerConfig) {
+    const endpoint = typeof endpointOrConfig === 'string' ? endpointOrConfig : endpointOrConfig?.endpoint;
     if (!endpoint || typeof endpoint !== 'string' || endpoint.trim().length === 0) {
       throw new Error('GraphQLIndexer endpoint must be a non-empty string');
     }
     this.endpoint = endpoint;
+    this.onQueryMetric = typeof endpointOrConfig === 'string' ? undefined : endpointOrConfig.onQueryMetric;
   }
 
   /**
@@ -175,6 +257,20 @@ export class GraphQLIndexer {
    * @returns The unwrapped `body.data` payload typed as `T`.
    */
   async query<T = unknown>(options: GraphQLQueryOptions): Promise<T> {
+    const startedAt = Date.now();
+    const queryName = this.getQueryName(options?.query);
+    try {
+      const result = await this.queryInternal<T>(options);
+      this.emitQueryMetric({ queryName, durationMs: Date.now() - startedAt, success: true });
+      return result;
+    } catch (error) {
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      this.emitQueryMetric({ queryName, durationMs: Date.now() - startedAt, success: false, error: normalizedError });
+      throw error;
+    }
+  }
+
+  private async queryInternal<T = unknown>(options: GraphQLQueryOptions): Promise<T> {
     if (this.isDestroyed) {
       throw new Error('GraphQLIndexer has been destroyed');
     }
@@ -243,14 +339,32 @@ export class GraphQLIndexer {
     return (body?.data) as T;
   }
 
+  private getQueryName(query: unknown): string {
+    if (typeof query !== 'string') return 'unknown';
+    const match = query.match(/\b(?:query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+    return match?.[1] ?? 'anonymous';
+  }
+
+  private emitQueryMetric(metric: IndexerQueryMetric): void {
+    try {
+      this.onQueryMetric?.(metric);
+    } catch {
+      // Telemetry must never change query behavior.
+    }
+  }
+
   /**
    * Fetches every page of a cursor-based GraphQL collection.
    *
    * The response is expected to contain one collection with an `items`,
    * `nodes`, or `results` array and GraphQL-style `pageInfo`. The helper
    * preserves the original query and updates its `variables.cursor` value.
+   *
+   * @deprecated Use the typed {@link fetchAll} overload with {@link FetchAllOptions}
+   * and a `getNextCursor` callback instead, which provides stronger types and
+   * throws {@link IndexerMaxPagesExceededError} on page-limit violations.
    */
-  async fetchAll(options: GraphQLQueryOptions): Promise<unknown[]> {
+  async fetchAllAuto(options: GraphQLQueryOptions): Promise<unknown[]> {
     const results: unknown[] = [];
     let cursor: unknown = options.variables?.cursor;
 
@@ -261,21 +375,21 @@ export class GraphQLIndexer {
       });
       const collection = findPaginatedCollection(data);
       if (!collection) {
-        throw new Error('GraphQLIndexer.fetchAll expected a paginated collection response');
+        throw new Error('GraphQLIndexer.fetchAllAuto expected a paginated collection response');
       }
       results.push(...collection.items);
 
       if (!collection.hasNextPage) return results;
       if (typeof collection.endCursor !== 'string' || collection.endCursor.length === 0) {
-        throw new Error('GraphQLIndexer.fetchAll received a page with no next cursor');
+        throw new Error('GraphQLIndexer.fetchAllAuto received a page with no next cursor');
       }
       if (collection.endCursor === cursor) {
-        throw new Error('GraphQLIndexer.fetchAll received an unchanged pagination cursor');
+        throw new Error('GraphQLIndexer.fetchAllAuto received an unchanged pagination cursor');
       }
       cursor = collection.endCursor;
     }
 
-    throw new Error(`GraphQLIndexer.fetchAll exceeded the maximum page limit of ${DEFAULT_INDEXER_MAX_PAGES}`);
+    throw new IndexerMaxPagesExceededError(DEFAULT_INDEXER_MAX_PAGES, DEFAULT_INDEXER_MAX_PAGES);
   }
 
   /**
@@ -635,6 +749,60 @@ export class GraphQLIndexer {
     return subscription;
   }
 
+  /**
+   * Fetches all pages of a paginated GraphQL query and returns the
+   * accumulated results as a single array.
+   *
+   * Each successive page is requested by merging the cursor returned by
+   * `getNextCursor` into the query variables as `{ cursor }`. Pagination
+   * stops when `getNextCursor` returns `null` or `undefined`.
+   *
+   * Throws {@link IndexerMaxPagesExceededError} (not a plain `Error`) if more
+   * than `maxPages` (default {@link DEFAULT_INDEXER_MAX_PAGES}) pages are
+   * required, so callers can `instanceof`-check for the page-limit case
+   * independently of network failures or timeouts. See #801.
+   *
+   * @example
+   * ```ts
+   * const rows = await indexer.fetchAll<{ transfers: Transfer[] }>({
+   *   query: LIST_TRANSFERS_QUERY,
+   *   variables: { limit: 100 },
+   *   getNextCursor: (page) => page.transfers.at(-1)?.cursor ?? null,
+   * });
+   * ```
+   */
+  async fetchAll<TPage>(options: FetchAllOptions<TPage>): Promise<TPage[]> {
+    const maxPages = options.maxPages ?? DEFAULT_INDEXER_MAX_PAGES;
+    const pages: TPage[] = [];
+    let cursor: string | null | undefined = undefined;
+    let pagesFetched = 0;
+
+    while (true) {
+      if (pagesFetched >= maxPages) {
+        throw new IndexerMaxPagesExceededError(pagesFetched, maxPages);
+      }
+
+      const variables: Record<string, unknown> = {
+        ...options.variables,
+        ...(cursor != null ? { cursor } : {}),
+      };
+
+      const result = await this.query({
+        query: options.query,
+        variables,
+        ...(options.headers != null ? { headers: options.headers } : {}),
+      });
+
+      pages.push(result as TPage);
+      pagesFetched += 1;
+
+      cursor = options.getNextCursor(result as TPage);
+      if (cursor == null) break;
+    }
+
+    return pages;
+  }
+
   getSubscriptionCount(): number {
     return this.activeSubscriptions.size;
   }
@@ -693,6 +861,93 @@ export class GraphQLIndexer {
       query,
       variables: { sender: senderAddress },
     });
+  }
+
+  /**
+   * Cursor-paginated variant of {@link streamsBySender}.
+   *
+   * Uses Relay-style `first`/`after` (forward) or `last`/`before` (backward)
+   * arguments instead of offset/limit, so deep pages cost the same as the
+   * first and records created between page fetches cannot shift the window.
+   * The returned `pageInfo` is decoded so callers can feed `endCursor` /
+   * `startCursor` straight back in as `afterCursor` / `beforeCursor`.
+   *
+   * @param senderAddress The sender's Stellar account address
+   * @param options Page size, cursors and query configuration
+   * @throws if both `afterCursor` and `beforeCursor` are given, if a cursor is
+   *   mixed with the opposite page-size argument, or if a page size is not a
+   *   positive integer
+   */
+  async fetchStreamsBySender<T = unknown>(
+    senderAddress: string,
+    options: FetchStreamsBySenderOptions = {},
+  ): Promise<IndexerPage<T>> {
+    const { first, last, afterCursor, beforeCursor, ...queryOptions } = options;
+
+    if (afterCursor !== undefined && beforeCursor !== undefined) {
+      throw new Error('fetchStreamsBySender: afterCursor and beforeCursor are mutually exclusive');
+    }
+    for (const [name, size] of [['first', first], ['last', last]] as const) {
+      if (size !== undefined && (!Number.isInteger(size) || size < 1)) {
+        throw new Error(`fetchStreamsBySender: ${name} must be a positive integer`);
+      }
+    }
+    if (first !== undefined && last !== undefined) {
+      throw new Error('fetchStreamsBySender: first and last are mutually exclusive');
+    }
+    if (beforeCursor !== undefined && first !== undefined) {
+      throw new Error('fetchStreamsBySender: beforeCursor must be paired with last, not first');
+    }
+    if (afterCursor !== undefined && last !== undefined) {
+      throw new Error('fetchStreamsBySender: afterCursor must be paired with first, not last');
+    }
+
+    const backward = beforeCursor !== undefined || last !== undefined;
+    const variables: Record<string, unknown> = { sender: senderAddress };
+    if (backward) {
+      if (last !== undefined) variables.last = last;
+      if (beforeCursor !== undefined) variables.before = beforeCursor;
+    } else {
+      if (first !== undefined) variables.first = first;
+      if (afterCursor !== undefined) variables.after = afterCursor;
+    }
+
+    const query = `
+      query FetchStreamsBySender($sender: String!, $first: Int, $after: String, $last: Int, $before: String) {
+        streamsBySender(sender: $sender, first: $first, after: $after, last: $last, before: $before) {
+          items {
+            id
+            sender
+            recipient
+            token
+            ratePerSecond
+            startTime
+            endTime
+            withdrawn
+            deposited
+            paused
+            pausedAt
+            cancelled
+            clawbackEnabled
+          }
+          pageInfo {
+            hasNextPage
+            hasPreviousPage
+            startCursor
+            endCursor
+          }
+        }
+      }
+    `;
+    const data = await this.query<{
+      streamsBySender?: { items?: T[]; nodes?: T[]; results?: T[]; pageInfo?: unknown };
+    }>({ ...queryOptions, query, variables });
+
+    const connection = data?.streamsBySender;
+    return {
+      items: connection?.items ?? connection?.nodes ?? connection?.results ?? [],
+      pageInfo: decodePageInfo(connection?.pageInfo),
+    };
   }
 
   /**

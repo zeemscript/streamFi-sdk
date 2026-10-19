@@ -9,15 +9,23 @@ import type {
   Subscription,
   FeeEstimate,
   StreamOperation,
+  Network,
+  BatchGetStreamsOptions,
+  GetStreamInfosResult,
 } from "./types/index.js";
 import type { WalletAdapter } from "./adapters/types.js";
-import { DEFAULT_RPC } from "./soroban.js";
+import { DEFAULT_RPC, getServer } from "./soroban.js";
+import { registerCustomFetch } from "./custom-fetch.js";
+import { SorobanRpc } from '@stellar/stellar-sdk';
 import { StreamsModule } from "./streams.js";
 import { FactoryModule } from "./factory.js";
 import { GovernorModule } from "./governor.js";
 import { Module26 } from "./module26.js";
 import { Module36 } from "./module36.js";
 import { Module44 } from "./module44.js";
+import { Module48 } from "./module48.js";
+import { Module49 } from "./module49.js";
+import { TokenModule } from "./token.js";
 import {
   SUPPORTED_NETWORKS,
   UnsupportedChainError,
@@ -83,6 +91,8 @@ function assertWalletNetworkMatch(
 export class ConduitClient {
   readonly streams: StreamsModule;
   readonly governor: GovernorModule;
+  /** SEP-41 token allowance reads and approvals. */
+  readonly tokens: TokenModule;
 
   /**
    * Access the DripFactory read-query module.
@@ -144,6 +154,59 @@ export class ConduitClient {
   }
   private _risk: Module44 | undefined;
 
+  /**
+   * Access the Module48 batch analytics evaluation module.
+   *
+   * Provides memoized batch evaluation and yield calculations.
+   */
+  get batchAnalytics(): Module48 {
+    if (!this._batchAnalytics) {
+      this._batchAnalytics = new Module48();
+    }
+    return this._batchAnalytics;
+  }
+  private _batchAnalytics: Module48 | undefined;
+
+  /** Aliased access to Module48. */
+  get module48(): Module48 {
+    return this.batchAnalytics;
+  }
+
+  /**
+   * Access the Module49 high-performance streaming analytics engine.
+   *
+   * Provides full-parameter memoized evaluation and batch yield calculations.
+   */
+  get batchEngine(): Module49 {
+    if (!this._batchEngine) {
+      this._batchEngine = new Module49();
+    }
+    return this._batchEngine;
+  }
+  private _batchEngine: Module49 | undefined;
+
+  /** Aliased access to Module49. */
+  get module49(): Module49 {
+    return this.batchEngine;
+  }
+
+  /**
+   * The Stellar network this client is connected to.
+   */
+  get network(): Network {
+    return this.config.network;
+  }
+
+  /**
+   * The underlying raw {@link SorobanRpc.Server} instance used by
+   * this client. Advanced integrators building custom contract
+   * interactions can use this to call Soroban RPC methods directly
+   * without creating a duplicate connection.
+   */
+  get rpcServer(): SorobanRpc.Server {
+    return getServer(this.config.rpcUrl);
+  }
+
   private readonly config: Required<Pick<ConduitConfig, "network" | "rpcUrl">> &
     ConduitConfig;
 
@@ -169,6 +232,11 @@ export class ConduitClient {
       rpcUrl: config.rpcUrl ?? DEFAULT_RPC[config.network],
     };
 
+    // Must precede module construction: modules may issue RPC calls at once.
+    if (this.config.customFetch) {
+      registerCustomFetch(this.config.rpcUrl, this.config.customFetch);
+    }
+
     // If a wallet is provided at construction time, validate its chain too.
     if (this.config.wallet) {
       assertWalletNetworkMatch(this.config.wallet, this.config.network);
@@ -176,6 +244,43 @@ export class ConduitClient {
 
     this.streams = new StreamsModule(this.config);
     this.governor = new GovernorModule(this.config);
+    this.tokens = new TokenModule(this.config);
+  }
+
+  /**
+   * Read many streams while staying under RPC rate limits.
+   *
+   * Duplicate IDs are collapsed, the remaining IDs are split into chunks of
+   * `chunkSize` (default 20) and chunks are read one after another, each with
+   * bounded concurrency (`maxConcurrency`, default 8). `chunkDelayMs` adds a
+   * pause between chunks. A failing stream is reported in `failures` rather
+   * than failing the whole batch.
+   *
+   * @example
+   * const { results, failures } = await client.getStreamsBatch(ids, { chunkSize: 10 });
+   */
+  async getStreamsBatch(
+    streamIds: (bigint | string)[],
+    options: BatchGetStreamsOptions = {},
+  ): Promise<GetStreamInfosResult> {
+    const chunkSize = Math.max(1, Math.floor(options.chunkSize ?? 20) || 20);
+    const chunkDelayMs = Math.max(0, options.chunkDelayMs ?? 0);
+    const unique = [...new Set(streamIds.map((id) => BigInt(id)))];
+
+    const results: StreamInfo[] = [];
+    const failures: GetStreamInfosResult['failures'] = [];
+    for (let i = 0; i < unique.length; i += chunkSize) {
+      if (i > 0 && chunkDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, chunkDelayMs));
+      }
+      const chunk = await this.streams.getStreamInfos(
+        unique.slice(i, i + chunkSize),
+        options.maxConcurrency === undefined ? {} : { maxConcurrency: options.maxConcurrency },
+      );
+      results.push(...chunk.results);
+      failures.push(...chunk.failures);
+    }
+    return { results, failures };
   }
 
   /**
@@ -293,9 +398,13 @@ export class ConduitClient {
    * **Wallet propagation contract:**
    * - {@link StreamsModule}: Updated immediately — all subsequent stream
    *   operations (create, withdraw, cancel, etc.) use the new wallet.
-   * - {@link FactoryModule}: NOT updated — this module is read-only and
-   *   uses `config.keypair` for simulation fee sourcing. It does not hold
-   *   a wallet reference and is unaffected by `setWallet()`.
+   * - {@link TokenModule}: Updated immediately — subsequent token approvals
+   *   use the new wallet.
+   * - {@link FactoryModule}: Updated — its read simulations are sourced
+   *   from the active wallet's public key, so a wallet swap re-resolves the
+   *   simulation source instead of leaving it pinned to the previous
+   *   wallet. A `client.factory` that has not been constructed yet picks
+   *   the new wallet up from `config` when it is lazily built (#784).
    * - {@link GovernorModule}: NOT updated — this module is read-only and
    *   uses `config.keypair` for simulation fee sourcing. It does not hold
    *   a wallet reference and is unaffected by `setWallet()`.
@@ -308,6 +417,13 @@ export class ConduitClient {
     assertWalletNetworkMatch(wallet, this.config.network);
     this.config.wallet = wallet;
     this.streams.setWallet(wallet);
+    this.tokens.setWallet(wallet);
+    // #784 — `FactoryModule` resolves its read-simulation source from a
+    // wallet adapter captured at construction, so it needs the swap too.
+    // Only when already constructed: a factory built later from the updated
+    // `config.wallet` above has nothing to catch up on. GovernorModule
+    // deliberately stays out — it holds no wallet at all.
+    this._factory?.setWallet(wallet);
   }
 
   /**

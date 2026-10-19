@@ -1,3 +1,5 @@
+import { SorobanRpc, xdr } from '@stellar/stellar-sdk';
+
 /**
  * Each of the three Conduit contracts defines its own `Error` enum in Rust —
  * the same numeric code means something different in each one (e.g. code 1
@@ -773,6 +775,36 @@ export class RpcServiceUnavailableError extends Error {
   }
 }
 
+// ── Circuit open ───────────────────────────────────────────────────────────────
+
+/**
+ * Thrown by {@link withRetry} when a `circuitScope` is provided and
+ * `rpc-circuit-state.ts` already reports that scope's circuit as `'open'`
+ * (repeated recent failures). Rather than dutifully retrying with
+ * exponential backoff against an endpoint the SDK itself has already
+ * determined is down, `withRetry` fails fast with this error instead of
+ * entering the retry loop. See #787.
+ */
+export class CircuitOpenError extends Error {
+  /** The circuit scope (typically an RPC URL) that is currently open. */
+  readonly scope: string;
+  /** Epoch ms when the circuit will move to 'half-open' and allow a probe request. */
+  readonly cooldownUntil: number | null;
+
+  constructor(scope: string, cooldownUntil: number | null) {
+    const waitMs = cooldownUntil !== null ? Math.max(0, cooldownUntil - Date.now()) : undefined;
+    super(
+      `Circuit for '${scope}' is open` +
+        (waitMs !== undefined ? ` — retrying in ${waitMs}ms` : '') +
+        '. Failing fast instead of retrying.',
+    );
+    this.name = 'CircuitOpenError';
+    this.scope = scope;
+    this.cooldownUntil = cooldownUntil;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 // ── Indexer timeout ────────────────────────────────────────────────────────────
 
 /**
@@ -872,6 +904,25 @@ export class ConfirmationTimeoutError extends Error {
   }
 }
 
+// ── Signature timeout ─────────────────────────────────────────────────────────
+
+/**
+ * Thrown when a wallet or signer does not produce a signature within the
+ * configured `signatureTimeoutMs` — e.g. the user opened a wallet popup and
+ * forgot about it or closed it without rejecting.
+ */
+export class SignatureTimeoutError extends Error {
+  /** The timeout window in milliseconds that was exceeded. */
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Signature request timed out after ${timeoutMs}ms without a response from the wallet or signer.`);
+    this.name = 'SignatureTimeoutError';
+    this.timeoutMs = timeoutMs;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 // ── Type guard ────────────────────────────────────────────────────────────────
 
 /**
@@ -880,6 +931,7 @@ export class ConfirmationTimeoutError extends Error {
  * `instanceof` across realms or bundled chunks.
  *
  * Recognised error classes:
+ * - {@link SorobanRpcError}
  * - {@link ConduitError}
  * - {@link UnsupportedChainError}
  * - {@link StreamFiNetworkError}
@@ -897,10 +949,15 @@ export class ConfirmationTimeoutError extends Error {
  * - {@link DurationTooShortError}
  * - {@link BackdatedStreamError}
  * - {@link ConfirmationTimeoutError}
+ * - {@link SignatureTimeoutError}
+ * - {@link CircuitOpenError}
+ * - {@link ValidationError}
+ * - {@link IndexerMaxPagesExceededError}
  */
 export function isConduitError(value: unknown): value is Error {
   if (!(value instanceof Error)) return false;
   return [
+    'SorobanRpcError',
     'ConduitError',
     'UnsupportedChainError',
     'StreamFiNetworkError',
@@ -918,8 +975,162 @@ export function isConduitError(value: unknown): value is Error {
     'DurationTooShortError',
     'BackdatedStreamError',
     'ConfirmationTimeoutError',
+    'SignatureTimeoutError',
+    'CircuitOpenError',
     'ValidationError',
-  ].includes(value.name);
+    'IndexerMaxPagesExceededError',
+   ].includes(value.name);
+}
+
+/**
+ * Result of decoding diagnostic events from a Soroban simulation error.
+ * Extracts structured diagnostic information that is otherwise buried
+ * in raw error strings.
+ */
+export interface SorobanDiagnosticInfo {
+  /** Decoded diagnostic events from the simulation response. */
+  diagnosticEvents: xdr.DiagnosticEvent[];
+  /** Host function call stack extracted from diagnostic events, or null. */
+  hostFunctionCallStack: string[] | null;
+  /** Auth failure reasons extracted from diagnostic events, or null. */
+  authFailureReasons: string[] | null;
+  /** Raw error string from the RPC response. */
+  rpcError: string;
+}
+
+/**
+ * Error thrown when a Soroban contract call reverts or fails at the
+ * RPC level. Unlike the generic `Error` strings previously thrown,
+ * this class extracts structured diagnostic information from the
+ * simulation response including diagnostic events, host function
+ * call stack, and auth failure reasons.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.streams.create({ ... });
+ * } catch (err) {
+ *   if (err instanceof SorobanRpcError) {
+ *     console.error(err.rpcError);
+ *     console.error('Diagnostic events:', err.diagnostics.diagnosticEvents);
+ *     console.error('Call stack:', err.diagnostics.hostFunctionCallStack);
+ *     console.error('Auth failures:', err.diagnostics.authFailureReasons);
+ *   }
+ * }
+ * ```
+ */
+export class SorobanRpcError extends Error {
+  /** The raw RPC error string. */
+  readonly rpcError: string;
+  /** Structured diagnostic information extracted from the simulation response. */
+  readonly diagnostics: SorobanDiagnosticInfo;
+
+  constructor(rpcError: string, diagnostics: SorobanDiagnosticInfo) {
+    super(rpcError);
+    this.name = 'SorobanRpcError';
+    this.rpcError = rpcError;
+    this.diagnostics = diagnostics;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+
+  /**
+   * Creates a {@link SorobanRpcError} from a Soroban simulation error response.
+   * Extracts diagnostic events, host function call stack, and auth
+   * failure reasons from the raw response.
+   *
+   * @param simError - The simulation error response from the Soroban RPC.
+   * @returns A typed {@link SorobanRpcError} with structured diagnostics.
+   */
+  static fromSimulationError(simError: { error: string; events?: xdr.DiagnosticEvent[] | string[] }): SorobanRpcError {
+    const rpcError = simError.error ?? 'Unknown Soroban RPC error';
+    const events = simError.events ?? [];
+
+    const diagnosticEvents = events.map(e =>
+      typeof e === 'string' ? xdr.DiagnosticEvent.fromXDR(e, 'base64') : e
+    );
+
+    const hostFunctionCallStack = SorobanRpcError.extractHostFunctionCallStack(diagnosticEvents);
+    const authFailureReasons = SorobanRpcError.extractAuthFailureReasons(diagnosticEvents);
+
+    const diagnostics: SorobanDiagnosticInfo = {
+      diagnosticEvents,
+      hostFunctionCallStack,
+      authFailureReasons,
+      rpcError,
+    };
+
+    return new SorobanRpcError(rpcError, diagnostics);
+  }
+
+  /**
+   * Creates a {@link SorobanRpcError} from a raw unknown error thrown by the RPC client.
+   * Attempts to extract structured information from the error.
+   *
+   * @param raw - The raw error from the RPC client.
+   * @returns A {@link SorobanRpcError} if the error can be decoded, or `null` if not.
+   */
+  static fromRaw(raw: unknown): SorobanRpcError | null {
+    if (!raw || typeof raw !== 'object') return null;
+
+    const resp = raw as { error?: unknown; events?: unknown; result?: { error?: unknown; events?: unknown } };
+    const result = resp.result as { error?: unknown; events?: unknown } | undefined;
+    const error = typeof resp.error === 'string' ? resp.error :
+      typeof result?.error === 'string' ? String(result.error) : undefined;
+
+    if (!error) return null;
+
+    const events = resp.events ?? result?.events ?? [];
+    return SorobanRpcError.fromSimulationError({ error, events: events as xdr.DiagnosticEvent[] | string[] });
+  }
+
+  /**
+   * Attempts to extract a host function call stack from diagnostic events.
+   * Returns null if no call stack can be identified.
+   */
+  private static extractHostFunctionCallStack(events: xdr.DiagnosticEvent[]): string[] | null {
+    const callStack: string[] = [];
+    for (const event of events) {
+      try {
+        const contractEvent = event.event();
+        const body = contractEvent.body();
+        const v0 = body.v0();
+        const topics = v0.topics()?.map(t => t.toString()) ?? [];
+        const data = v0.data();
+        const dataStr = data?.toString() ?? '';
+        if (topics.length > 0 || dataStr.length > 0) {
+          callStack.push(`Topics: ${topics.join(', ')} | Data: ${dataStr}`);
+        }
+      } catch {
+        // Skip events that can't be decoded
+      }
+    }
+    return callStack.length > 0 ? callStack : null;
+  }
+
+  /**
+   * Attempts to extract auth failure reasons from diagnostic events.
+   * Returns null if no auth failures can be identified.
+   */
+  private static extractAuthFailureReasons(events: xdr.DiagnosticEvent[]): string[] | null {
+    const reasons: string[] = [];
+    for (const event of events) {
+      try {
+        const contractEvent = event.event();
+        const body = contractEvent.body();
+        const v0 = body.v0();
+        const data = v0.data();
+        if (data) {
+          const valStr = data.toString();
+          if (/auth/i.test(valStr) || /authorize/i.test(valStr) || /permission/i.test(valStr)) {
+            reasons.push(valStr);
+          }
+        }
+      } catch {
+        // Skip events that can't be decoded
+      }
+    }
+    return reasons.length > 0 ? reasons : null;
+  }
 }
 
 // ── Validation error ─────────────────────────────────────────────────────────
@@ -955,4 +1166,103 @@ export class ValidationError extends Error {
     this.issues = Object.freeze(issues.slice());
     Object.setPrototypeOf(this, new.target.prototype);
   }
+}
+
+/**
+ * Thrown by {@link GraphQLIndexer.fetchAll} when the paginated query
+ * accumulates more pages than the configured maximum
+ * (`DEFAULT_INDEXER_MAX_PAGES`, 1 000 by default), preventing runaway
+ * memory usage or accidental full-table scans.
+ *
+ * Consumers can distinguish this from network failures or timeouts with a
+ * standard `instanceof` check:
+ *
+ * @example
+ * ```ts
+ * try {
+ *   const rows = await indexer.fetchAll({ query, getNextCursor });
+ * } catch (err) {
+ *   if (err instanceof IndexerMaxPagesExceededError) {
+ *     console.error(
+ *       `Query aborted after ${err.attemptedPages} pages ` +
+ *       `(limit is ${err.maxPages}).`,
+ *     );
+ *   }
+ * }
+ * ```
+ *
+ * See #801.
+ */
+export class IndexerMaxPagesExceededError extends Error {
+  /** The number of pages that had been fetched when the limit was hit. */
+  readonly attemptedPages: number;
+  /** The maximum number of pages that was configured. */
+  readonly maxPages: number;
+
+  constructor(attemptedPages: number, maxPages: number) {
+    super(
+      `GraphQLIndexer.fetchAll exceeded the maximum page limit of ${maxPages} ` +
+      `(fetched ${attemptedPages} pages). ` +
+      `Refine your query filters or increase the limit via fetchAllOptions.maxPages.`,
+    );
+    this.name = 'IndexerMaxPagesExceededError';
+    this.attemptedPages = attemptedPages;
+    this.maxPages = maxPages;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+// ── Recoverable error classification ─────────────────────────────────────────
+
+const RECOVERABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RECOVERABLE_NODE_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND',
+  'EAI_AGAIN', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT',
+]);
+const RECOVERABLE_ERROR_NAMES = new Set([
+  'RateLimitError', 'RpcServiceUnavailableError', 'StreamFiNetworkError',
+  'IndexerTimeoutError', 'ConfirmationTimeoutError', 'CircuitOpenError', 'TimeoutError',
+]);
+
+function isRecoverableOnce(err: unknown): boolean | undefined {
+  if (err === null || typeof err !== 'object') return undefined;
+  const e = err as {
+    name?: unknown; code?: unknown; status?: unknown;
+    response?: { status?: unknown };
+  };
+
+  if (typeof e.name === 'string' && RECOVERABLE_ERROR_NAMES.has(e.name)) return true;
+  // The caller cancelled; retrying would defy their intent.
+  if (e.name === 'OperationAbortedError' || e.name === 'AbortError') return false;
+  // Typed SDK errors that are not transport-related (contract rejections,
+  // validation, signature timeouts) will fail identically on retry.
+  if (isConduitError(err)) return false;
+
+  const status = typeof e.status === 'number' ? e.status : e.response?.status;
+  if (typeof status === 'number') return RECOVERABLE_HTTP_STATUSES.has(status);
+
+  // JSON-RPC style numeric codes mirror the HTTP status (see RateLimitError).
+  if (typeof e.code === 'number') return RECOVERABLE_HTTP_STATUSES.has(e.code) ? true : undefined;
+  if (typeof e.code === 'string' && RECOVERABLE_NODE_CODES.has(e.code)) return true;
+
+  // `fetch` rejects with a bare TypeError when the network is unreachable.
+  if (err instanceof TypeError && /failed to fetch|network|load failed/i.test(err.message)) return true;
+  return undefined;
+}
+
+/**
+ * Returns `true` when `err` represents a transient failure that is worth
+ * retrying or failing over to another RPC endpoint: rate limits, 408/425/429/5xx
+ * HTTP statuses, socket-level errors (`ECONNRESET`, `ETIMEDOUT`, …), timeouts,
+ * and an open circuit. Contract errors, validation errors, user aborts and
+ * unknown values return `false`. The `cause` chain is followed.
+ */
+export function isRecoverableError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current != null; depth++) {
+    const verdict = isRecoverableOnce(current);
+    if (verdict !== undefined) return verdict;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
 }

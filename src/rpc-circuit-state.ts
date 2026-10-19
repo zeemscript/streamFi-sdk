@@ -47,10 +47,65 @@ function notifyListeners(scope: string, state: CircuitStatus): void {
 }
 
 /**
+ * Listener invoked on every circuit state transition (e.g. closed -> open).
+ * `scope` identifies the RPC endpoint whose circuit changed.
+ */
+export type CircuitTransitionListener = (from: CircuitState, to: CircuitState, scope: string) => void;
+const transitionListeners = new Set<CircuitTransitionListener>();
+
+function emitTransition(scope: string, from: CircuitState, to: CircuitState): void {
+  if (from === to) return;
+  for (const listener of transitionListeners) {
+    try {
+      listener(from, to, scope);
+    } catch {
+      // Listener errors must not break circuit state management.
+    }
+  }
+}
+
+/**
+ * Subscribe to every circuit state transition across all scopes, including
+ * the cooldown-driven `open` -> `half-open` transition. Returns an
+ * unsubscribe function.
+ *
+ * @example
+ * const off = subscribeCircuitTransitions((from, to, scope) => {
+ *   if (to === 'open') showBanner(`RPC ${scope} is degraded`);
+ * });
+ */
+export function subscribeCircuitTransitions(listener: CircuitTransitionListener): () => void {
+  transitionListeners.add(listener);
+  return () => {
+    transitionListeners.delete(listener);
+  };
+}
+
+/**
  * Subscribe to circuit state changes. Returns an unsubscribe function.
  * Called on every `recordSuccess`, `recordFailure`, and `resetCircuit`.
  */
 export function onCircuitChange(listener: CircuitListener): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * Subscribe to circuit state changes for a specific scope. Returns an
+ * unsubscribe function. The callback is invoked only when the circuit's
+ * state actually transitions (e.g. closed -> open), not on every call.
+ */
+export function onCircuitStateChange(
+  scope: string,
+  callback: (state: CircuitStatus) => void,
+): () => void {
+  const listener: CircuitListener = (scopedScope, state) => {
+    if (scopedScope === scope) {
+      callback(state);
+    }
+  };
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
@@ -84,6 +139,7 @@ export function getCircuitState(scope: string): CircuitStatus {
   // Auto-transition from 'open' to 'half-open' after cooldown
   if (entry.state === 'open' && entry.cooldownUntil && Date.now() >= entry.cooldownUntil) {
     entry.state = 'half-open';
+    emitTransition(scope, 'open', 'half-open');
   }
 
   return {
@@ -102,11 +158,15 @@ export function getCircuitState(scope: string): CircuitStatus {
 export function recordSuccess(scope: string): void {
   const entry = circuits.get(scope);
   if (!entry) return;
+  const previousState = getCircuitState(scope).state;
   entry.failureCount = 0;
   entry.lastSuccessAt = Date.now();
   entry.state = 'closed';
   entry.cooldownUntil = null;
-  notifyListeners(scope, getCircuitState(scope));
+  if (previousState !== 'closed') {
+    notifyListeners(scope, getCircuitState(scope));
+    emitTransition(scope, previousState, 'closed');
+  }
 }
 
 /**
@@ -134,12 +194,18 @@ export function recordFailure(
     circuits.set(scope, entry);
   }
 
+  const previousState = getCircuitState(scope).state;
+
   // In half-open state, any failure re-opens the circuit
   if (entry.state === 'half-open') {
     entry.state = 'open';
     entry.failureCount += 1;
     entry.lastFailureAt = now;
     entry.cooldownUntil = now + cooldownMs;
+    if (previousState !== 'open') {
+      notifyListeners(scope, getCircuitState(scope));
+    }
+    emitTransition(scope, previousState, 'open');
     return;
   }
 
@@ -150,15 +216,23 @@ export function recordFailure(
     entry.state = 'open';
     entry.cooldownUntil = now + cooldownMs;
   }
-  notifyListeners(scope, getCircuitState(scope));
+  if (entry.state !== previousState) {
+    notifyListeners(scope, getCircuitState(scope));
+    emitTransition(scope, previousState, entry.state);
+  }
 }
 
 /**
  * Reset the circuit for a given scope (e.g. on manual retry).
  */
 export function resetCircuit(scope: string): void {
+  const hadEntry = circuits.has(scope);
+  const previousState = hadEntry ? getCircuitState(scope).state : 'closed';
   circuits.delete(scope);
-  notifyListeners(scope, getCircuitState(scope));
+  if (hadEntry) {
+    notifyListeners(scope, getCircuitState(scope));
+    emitTransition(scope, previousState, 'closed');
+  }
 }
 
 /**
