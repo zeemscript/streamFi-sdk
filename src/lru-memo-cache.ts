@@ -19,6 +19,8 @@ export interface MemoCacheMetrics {
 
 export class LruMemoCache<K, V> {
   private readonly store = new Map<K, V>();
+  /** Absolute expiry (epoch ms) for entries stored with a `ttlMs`. */
+  private readonly expiresAt = new Map<K, number>();
   private cacheHits = 0;
   private cacheMisses = 0;
   private hitExecutionTimeMs = 0;
@@ -30,8 +32,25 @@ export class LruMemoCache<K, V> {
     return this.store.size;
   }
 
-  /** Look up a key, refreshing its LRU position on hit. */
+  private isExpired(key: K): boolean {
+    const expiry = this.expiresAt.get(key);
+    return expiry !== undefined && Date.now() >= expiry;
+  }
+
+  private remove(key: K): void {
+    this.store.delete(key);
+    this.expiresAt.delete(key);
+  }
+
+  /**
+   * Look up a key, refreshing its LRU position on hit. An entry past its
+   * `ttlMs` is dropped and reported as a miss.
+   */
   get(key: K): V | undefined {
+    if (this.isExpired(key)) {
+      this.remove(key);
+      return undefined;
+    }
     const value = this.store.get(key);
     if (value !== undefined) {
       this.store.delete(key);
@@ -40,15 +59,25 @@ export class LruMemoCache<K, V> {
     return value;
   }
 
-  /** Insert a key, evicting the least-recently-used entry if at capacity. */
-  set(key: K, value: V): void {
+  /**
+   * Insert a key, evicting the least-recently-used entry if at capacity.
+   *
+   * @param ttlMs Optional time-to-live in milliseconds. Once elapsed the entry
+   *   is no longer returned by `get()`. Omit for an entry that never expires;
+   *   re-setting a key replaces any previous TTL.
+   */
+  set(key: K, value: V, ttlMs?: number): void {
+    if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs <= 0)) {
+      throw new RangeError('LruMemoCache ttlMs must be a positive finite number');
+    }
     if (this.store.has(key)) {
-      this.store.delete(key);
+      this.remove(key);
     } else if (this.store.size >= this.maxSize) {
       const oldest = this.store.keys().next().value;
-      if (oldest !== undefined) this.store.delete(oldest);
+      if (oldest !== undefined) this.remove(oldest);
     }
     this.store.set(key, value);
+    if (ttlMs !== undefined) this.expiresAt.set(key, Date.now() + ttlMs);
   }
 
   recordHit(elapsedMs: number): void {
@@ -63,6 +92,7 @@ export class LruMemoCache<K, V> {
 
   clear(): void {
     this.store.clear();
+    this.expiresAt.clear();
     this.cacheHits = 0;
     this.cacheMisses = 0;
     this.hitExecutionTimeMs = 0;

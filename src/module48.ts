@@ -48,9 +48,47 @@ interface CachedResult {
  * Module 48: stream analytics batch-evaluation helper.
  *
  * Implements Feature #48 with memoized withdrawable/progress calculation.
- * Speedup from caching is workload-dependent (proportional to cache hit
- * rate); call `getPerformanceMetrics()` for this instance's own measured
- * hit/miss timing rather than assuming a fixed percentage.
+ *
+ * ## Comparison & Consolidation Note (Issue #778)
+ * `Module48` and `Module49` serve related streaming analytics batch-evaluation tasks,
+ * but differ in key structural and operational choices:
+ *
+ * 1. **Cache Key Scope**:
+ *    - `Module48` key format: `${id}_${withdrawn}_${paused}_${nowSec}`.
+ *      Focuses on basic stream identity and paused state.
+ *    - `Module49` key format: `${id}_${withdrawn}_${paused}_${cancelled}_${pausedAt}_${ratePerSecond}_${startTime}_${endTime}_${nowSec}`.
+ *      Includes full lifecycle and rate parameters for strict cache invalidation across rate changes or cancellations.
+ *
+ * 2. **Performance Metrics & Measurement**:
+ *    - `Module48`: Measures exact cache hit vs miss execution duration per item and calculates `measuredSpeedupPercent` via `LruMemoCache.metrics()`.
+ *    - `Module49`: Tracks overall batch processing time in `processStreamBatch()` and computes a straight `hitRate` ratio (`cacheHits / totalRequests`).
+ *
+ * 3. **Batch Allocation Strategy**:
+ *    - `Module48`: Pre-allocates result array (`new Array(items.length)`) for deterministic index mapping during chunked processing.
+ *    - `Module49`: Appends results dynamically per chunk while measuring total batch wall-clock execution time.
+ *
+ * @example
+ * ```ts
+ * import { Module48 } from '@conduit-protocol/sdk';
+ *
+ * // `stream` is an active StreamInfo: 10n per second from t=1000 to t=2000
+ * // with nothing withdrawn yet.
+ * const analytics = new Module48();
+ * const item = { id: 'a', stream, timestamp: 1_500 };
+ *
+ * const first = analytics.processSingleItem(item);
+ * console.log(first.withdrawable); // 5000n
+ * console.log(first.progress);     // 0.5
+ * console.log(first.isCached);     // false
+ *
+ * // The same item again, this time through the batch entry point: cached.
+ * analytics.processStreamBatch([item])[0]?.isCached; // true
+ *
+ * const { cacheHits, cacheMisses } = analytics.getPerformanceMetrics();
+ * // cacheHits === 1, cacheMisses === 1
+ *
+ * analytics.computeOptimizedYield(10n, 100); // 1000n
+ * ```
  */
 export class Module48 {
   private readonly enableOptimization: boolean;

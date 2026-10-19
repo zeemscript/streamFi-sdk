@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { LruMemoCache } from '../lru-memo-cache.js';
 
 describe('LruMemoCache', () => {
@@ -60,5 +60,43 @@ describe('LruMemoCache', () => {
     expect(metrics.cacheHits).toBe(0);
     expect(metrics.cacheMisses).toBe(0);
     expect(metrics.measuredSpeedupPercent).toBeNull();
+  });
+});
+
+describe('LruMemoCache TTL', () => {
+  it('returns an entry before its ttl elapses and drops it afterwards', () => {
+    vi.useFakeTimers();
+    try {
+      const cache = new LruMemoCache<string, number>(10);
+      cache.set('a', 1, 1000);
+      vi.advanceTimersByTime(999);
+      expect(cache.get('a')).toBe(1);
+      vi.advanceTimersByTime(1);
+      expect(cache.get('a')).toBeUndefined();
+      expect(cache.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never expires entries set without a ttl, and re-set replaces the ttl', () => {
+    vi.useFakeTimers();
+    try {
+      const cache = new LruMemoCache<string, number>(10);
+      cache.set('forever', 1);
+      cache.set('a', 1, 100);
+      cache.set('a', 2);
+      vi.advanceTimersByTime(10_000);
+      expect(cache.get('forever')).toBe(1);
+      expect(cache.get('a')).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a non-positive ttl', () => {
+    const cache = new LruMemoCache<string, number>(10);
+    expect(() => cache.set('a', 1, 0)).toThrow(RangeError);
+    expect(() => cache.set('a', 1, NaN)).toThrow(RangeError);
   });
 });
